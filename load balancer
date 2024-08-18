@@ -1,0 +1,184 @@
+# Configure the AWS provider
+provider "aws" {
+  region = "us-east-2"
+}
+
+# Create a VPC
+resource "aws_vpc" "web_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "web-vpc"
+  }
+}
+
+# Create an Internet Gateway
+resource "aws_internet_gateway" "web_igw" {
+  vpc_id = aws_vpc.web_vpc.id
+
+  tags = {
+    Name = "web-igw"
+  }
+}
+
+# Create a subnet in us-east-1a
+resource "aws_subnet" "web_subnet_1" {
+  vpc_id            = aws_vpc.web_vpc.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "web-subnet-1"
+  }
+}
+
+# Create a subnet in us-east-1b
+resource "aws_subnet" "web_subnet_2" {
+  vpc_id            = aws_vpc.web_vpc.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "us-east-1b"
+
+  tags = {
+    Name = "web-subnet-2"
+  }
+}
+
+# Create a route table
+resource "aws_route_table" "web_route_table" {
+  vpc_id = aws_vpc.web_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.web_igw.id
+  }
+
+  tags = {
+    Name = "web-route-table"
+  }
+}
+
+# Associate the route table with subnet 1
+resource "aws_route_table_association" "web_route_assoc_1" {
+  subnet_id      = aws_subnet.web_subnet_1.id
+  route_table_id = aws_route_table.web_route_table.id
+}
+
+# Associate the route table with subnet 2
+resource "aws_route_table_association" "web_route_assoc_2" {
+  subnet_id      = aws_subnet.web_subnet_2.id
+  route_table_id = aws_route_table.web_route_table.id
+}
+
+# Create a security group for the web servers
+resource "aws_security_group" "web_sg" {
+  name        = "web-sg"
+  description = "Security group for web servers"
+  vpc_id      = aws_vpc.web_vpc.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]  # Note: In production, restrict this to your IP
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "web-sg"
+  }
+}
+
+# Create two EC2 instances (web servers)
+resource "aws_instance" "web_server" {
+  count                  = 2
+  ami                    = "ami-0c55b159cbfafe1f0"  # Amazon Linux 2 AMI (HVM), SSD Volume Type
+  instance_type          = "t2.micro"
+  key_name               = "your-key-pair-name"  # Replace with your key pair name
+  vpc_security_group_ids = [aws_security_group.web_sg.id]
+  subnet_id              = count.index == 0 ? aws_subnet.web_subnet_1.id : aws_subnet.web_subnet_2.id
+
+  user_data = <<-EOF
+              #!/bin/bash
+              yum update -y
+              yum install -y httpd
+              systemctl start httpd
+              systemctl enable httpd
+              echo "<h1>Hello from $(hostname -f)</h1>" > /var/www/html/index.html
+              EOF
+
+  tags = {
+    Name = "web-server-${count.index + 1}"
+  }
+}
+
+# Create an Application Load Balancer
+resource "aws_lb" "web_alb" {
+  name               = "web-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.web_sg.id]
+  subnets            = [aws_subnet.web_subnet_1.id, aws_subnet.web_subnet_2.id]
+
+  tags = {
+    Name = "web-alb"
+  }
+}
+
+# Create a target group for the ALB
+resource "aws_lb_target_group" "web_tg" {
+  name     = "web-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.web_vpc.id
+
+  health_check {
+    path                = "/"
+    healthy_threshold   = 2
+    unhealthy_threshold = 10
+  }
+}
+
+# Attach the EC2 instances to the target group
+resource "aws_lb_target_group_attachment" "web_tg_attachment" {
+  count            = 2
+  target_group_arn = aws_lb_target_group.web_tg.arn
+  target_id        = aws_instance.web_server[count.index].id
+  port             = 80
+}
+
+# Create a listener for the ALB
+resource "aws_lb_listener" "web_listener" {
+  load_balancer_arn = aws_lb.web_alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web_tg.arn
+  }
+}
+
+# Output the public IPs of the EC2 instances
+output "web_server_public_ips" {
+  value = aws_instance.web_server[*].public_ip
+}
+
+# Output the DNS name of the load balancer
+output "alb_dns_name" {
+  value       = aws_lb.web_alb.dns_name
+  description = "The DNS name of the Application Load Balancer"
+}
